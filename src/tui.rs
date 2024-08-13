@@ -4,11 +4,7 @@ use crossterm::{
     event::{EventStream, KeyCode, KeyEvent},
     terminal,
 };
-use futures::{
-    future::Fuse,
-    stream::{Chunks, Next},
-    FutureExt, StreamExt,
-};
+use futures::{future::Fuse, stream::Next, FutureExt, StreamExt};
 use indexmap::IndexMap;
 use ratatui::{
     backend::CrosstermBackend,
@@ -16,120 +12,119 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListDirection},
-    Terminal,
+    Frame, Terminal,
 };
 use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    task::JoinHandle,
 };
 use tui_textarea::TextArea;
 
-pub struct Chat {
-    messages: VecDeque<Message>,
+use crate::config::Config;
+
+pub struct Chat<'a> {
+    lines: VecDeque<Line<'a>>,
+    bg_darken: bool,
 }
 
-impl Chat {
+impl<'a> Chat<'a> {
     pub fn new() -> Self {
         Self {
-            messages: VecDeque::with_capacity(100),
+            lines: VecDeque::with_capacity(100),
+            bg_darken: false,
         }
     }
 
-    pub fn push_message(&mut self, message: Message) {
-        if self.messages.len() == self.messages.capacity() {
-            self.messages.pop_back();
-            self.messages.push_front(message);
-        } else {
-            self.messages.push_front(message);
-        }
-    }
-
-    pub fn list(&mut self) -> List {
-        let list = self.messages.iter().cloned().enumerate().map(|(i, m)| {
-            Line::from(vec![
-                Span::styled(m.username, Style::default().blue()),
-                Span::styled(": ", Style::default()),
-                Span::styled(m.msg, Style::default()),
-            ])
-            .bg(if i % 2 == 0 {
+    pub fn push_message(&mut self, mention_finder: &memchr::memmem::Finder, message: Message) {
+        let found_mention = mention_finder.find(message.msg.as_bytes()).is_some();
+        let line = Line::from(vec![
+            Span::styled(message.username, Style::default().blue()),
+            Span::styled(": ", Style::default()),
+            Span::styled(message.msg, Style::default()),
+        ])
+        .bg({
+            if found_mention {
+                Color::Red
+            } else if self.bg_darken {
                 Color::Black
             } else {
                 Color::Reset
-            })
+            }
         });
-        List::new(list).direction(ListDirection::BottomToTop).block(
-            Block::bordered()
-                .title("#forsen")
-                .title_alignment(Alignment::Center),
-        )
+
+        self.bg_darken = !self.bg_darken;
+
+        if self.lines.len() == self.lines.capacity() {
+            self.lines.pop_back();
+            self.lines.push_front(line);
+        } else {
+            self.lines.push_front(line);
+        }
+    }
+
+    //TODO: remove clones
+    pub fn list(&self, title: String) -> List<'a> {
+        List::new(self.lines.clone())
+            .direction(ListDirection::BottomToTop)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center),
+            )
     }
 }
 
-pub enum PopupKind {
-    JoinChannel,
-}
-
-pub struct Popup {
-    kind: PopupKind,
-}
-
-impl Popup {
-    pub fn new(kind: PopupKind) -> Self {
-        Self { kind }
-    }
-}
-
+#[allow(unused)]
 pub struct Tui<'a> {
-    term: Terminal<CrosstermBackend<Stdout>>,
-    task: JoinHandle<()>,
-    event_rx: UnboundedReceiver<Event>,
-    handler_tx: UnboundedSender<HandlerEvent>,
-    tabs: IndexMap<String, Chat>,
+    tabs: IndexMap<String, Chat<'a>>,
     active_tab: Option<String>,
-    popup: Option<Popup>,
     textarea: TextArea<'a>,
 }
 
-impl Tui<'_> {
-    pub fn new() -> eyre::Result<Self> {
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let term = Terminal::new(backend)?;
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (handler_tx, handler_rx) = mpsc::unbounded_channel();
-        let mut handler = EventHandler::new(event_tx, handler_rx, Duration::from_millis(60));
-        let task = tokio::spawn(async move {
-            handler.run().await.unwrap();
-        });
-
+impl Default for Tui<'_> {
+    fn default() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_block(Block::default().borders(Borders::ALL));
 
-        Ok(Self {
-            term,
-            task,
-            event_rx,
-            handler_tx,
-            tabs: IndexMap::from([
-                ("#forsen".into(), Chat::new()),
-                ("#zoil".into(), Chat::new()),
-            ]),
-            active_tab: Some("#forsen".into()),
-            popup: None,
+        Self {
+            active_tab: None,
+            tabs: IndexMap::default(),
             textarea,
-        })
+        }
     }
+}
 
-    pub async fn run(&mut self) -> eyre::Result<()> {
-        self.enter()?;
+impl Tui<'_> {
+    pub async fn run(&mut self, cfg: Config) -> eyre::Result<()> {
+        let mut term = self.enter()?;
+        self.active_tab = Some(cfg.channels.first().map_or("".into(), |s| s.to_string()));
+        self.tabs = IndexMap::from_iter(
+            cfg.channels
+                .iter()
+                .map(|c| (c.clone().into_owned(), Chat::new())),
+        );
 
+        // Draw first frame early as possible
+        term.draw(|frame| {
+            self.render(frame);
+        })?;
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_handler_tx, handler_rx) = mpsc::unbounded_channel();
+        let mut handler =
+            EventHandler::new(cfg.clone(), event_tx, handler_rx, Duration::from_millis(60));
+
+        tokio::spawn(async move {
+            handler.run().await.unwrap();
+        });
+
+        let mention_finder = memchr::memmem::Finder::new(cfg.username.as_ref());
         loop {
-            let Some(e) = self.event_rx.recv().await else {
+            let Some(e) = event_rx.recv().await else {
                 continue;
             };
             match e {
-                Event::KeyEvent(k) => match k {
+                Event::Key(k) => match k {
                     KeyEvent {
                         code: KeyCode::Char('q'),
                         ..
@@ -142,71 +137,70 @@ impl Tui<'_> {
                     }
                 },
                 Event::Draw => {
-                    self.draw().await?;
+                    term.draw(|frame| {
+                        self.render(frame);
+                    })?;
                 }
                 Event::Message(message) => {
                     if let Some(c) = self.tabs.get_mut(&message.channel) {
-                        c.push_message(message);
+                        c.push_message(&mention_finder, message);
                     }
                 }
             }
         }
 
-        self.leave()
+        self.leave(term)
     }
 
-    fn enter(&self) -> eyre::Result<()> {
+    fn enter(&self) -> eyre::Result<Terminal<CrosstermBackend<Stdout>>> {
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let term = Terminal::new(backend)?;
         terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
-        Ok(())
+        Ok(term)
     }
 
-    fn leave(&self) -> eyre::Result<()> {
+    fn leave(&self, _term: Terminal<CrosstermBackend<Stdout>>) -> eyre::Result<()> {
         crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
         Ok(())
     }
 
-    async fn draw(&mut self) -> eyre::Result<()> {
-        self.term.draw(|frame| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(95), Constraint::Percentage(5)])
-                .split(frame.area());
+    fn render(&self, frame: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(90), Constraint::Percentage(10)])
+            .split(frame.area());
 
-            frame.render_widget(&self.textarea, chunks[1]);
-            let active = self.active_tab.clone().unwrap_or("".into());
+        frame.render_widget(&self.textarea, chunks[1]);
+        let active = self.active_tab.clone().unwrap_or("".into());
 
-            let mut tabs = Block::bordered().title_alignment(Alignment::Center);
-            for (name, _) in &mut self.tabs {
-                tabs = tabs.title(if name == &active {
-                    name.clone().into()
-                } else {
-                    name.clone().dim()
-                });
-            }
-
-            if let Some(active) = self.tabs.get_mut(&active) {
-                frame.render_widget(active.list().block(tabs), chunks[0]);
+        let mut tabs = Block::bordered().title_alignment(Alignment::Center);
+        for (name, _) in &self.tabs {
+            tabs = tabs.title(if name == &active {
+                name.clone().into()
             } else {
-                frame.render_widget(tabs, chunks[0]);
-            }
-        })?;
-        Ok(())
+                name.clone().dim()
+            });
+        }
+
+        if let Some(active_chat) = self.tabs.get(&active) {
+            frame.render_widget(active_chat.list(active).block(tabs), chunks[0]);
+        } else {
+            frame.render_widget(tabs, chunks[0]);
+        }
     }
 }
 
 #[derive(PartialEq, PartialOrd)]
 pub enum Event {
     Draw,
-    KeyEvent(crossterm::event::KeyEvent),
+    Key(crossterm::event::KeyEvent),
     Message(Message),
 }
 
 #[derive(PartialEq, PartialOrd)]
-pub enum HandlerEvent {
-    Join(String),
-}
+pub enum HandlerEvent {}
 
 #[derive(Clone, PartialEq, PartialOrd)]
 pub struct Message {
@@ -219,11 +213,12 @@ pub struct EventHandler {
     handler_rx: UnboundedReceiver<HandlerEvent>,
     event_tx: UnboundedSender<Event>,
     frame_duration: Duration,
-    tmi_channel: String,
+    cfg: Config,
 }
 
 impl EventHandler {
     pub fn new(
+        cfg: Config,
         event_tx: UnboundedSender<Event>,
         handler_rx: UnboundedReceiver<HandlerEvent>,
         frame_duration: Duration,
@@ -232,16 +227,22 @@ impl EventHandler {
             event_tx,
             handler_rx,
             frame_duration,
-            tmi_channel: "#forsen".into(),
+            cfg,
         }
     }
 
     pub async fn run(&mut self) -> eyre::Result<()> {
         let mut draw_interval = tokio::time::interval(self.frame_duration);
         let mut reader = crossterm::event::EventStream::new();
-        let mut client = tmi::Client::anonymous().await?;
-        let mut channels = vec![self.tmi_channel.clone()];
-        client.join_all(&channels).await?;
+        let mut client = tmi::Client::builder()
+            .credentials(tmi::Credentials {
+                login: self.cfg.username.to_string(),
+                token: Some(self.cfg.token.to_string()),
+            })
+            .connect()
+            .await?;
+
+        client.join_all(&self.cfg.channels).await?;
 
         let mut tmi_event_tx = self.event_tx.clone();
         loop {
@@ -250,19 +251,15 @@ impl EventHandler {
 
             select! {
                 e = self.handler_rx.recv() => {
-                    if let Some(e) = e {
-                        match e {
-                            HandlerEvent::Join(c) => {
-                                channels = vec![c];
-                            },
-                        }
+                    if let Some(_e) = e {
+                        // Placeholder
                     }
                 }
                 _ = draw_delay => {
                     self.event_tx.send(Event::Draw)?;
                 }
                 _ = Self::crossterm_event(term_event, &mut self.event_tx) => {}
-                _ = Self::tmi_event(&mut client, &channels, &mut tmi_event_tx) => {}
+                _ = Self::tmi_event(&self.cfg, &mut client, &mut tmi_event_tx) => {}
             }
         }
     }
@@ -275,7 +272,7 @@ impl EventHandler {
         if let Some(Ok(e)) = term_event.await {
             match e {
                 crossterm::event::Event::Key(k) => {
-                    event_tx.send(Event::KeyEvent(k))?;
+                    event_tx.send(Event::Key(k))?;
                 }
                 _ => (),
             }
@@ -283,9 +280,9 @@ impl EventHandler {
         Ok(())
     }
 
-    async fn tmi_event(
+    async fn tmi_event<'a>(
+        cfg: &Config,
         client: &mut tmi::Client,
-        channels: &Vec<String>,
         event_tx: &mut UnboundedSender<Event>,
     ) -> eyre::Result<()> {
         let msg = client.recv().await?;
@@ -299,7 +296,7 @@ impl EventHandler {
             }
             tmi::Message::Reconnect => {
                 client.reconnect().await?;
-                client.join_all(channels).await?;
+                client.join_all(&cfg.channels).await?;
             }
             tmi::Message::Ping(ping) => {
                 client.pong(&ping).await?;

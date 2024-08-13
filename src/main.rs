@@ -5,6 +5,6 @@ mod tui;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let mut tui = Tui::new()?;
-    tui.run().await
+    let cfg = config::from_config_dir()?;
+    Tui::default().run(cfg).await
 }
