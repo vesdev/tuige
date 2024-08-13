@@ -1,6 +1,7 @@
 use tui::Tui;
 
 mod config;
+mod event;
 mod tui;
 
 #[tokio::main]

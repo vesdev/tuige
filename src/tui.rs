@@ -1,10 +1,9 @@
-use std::{collections::VecDeque, io::Stdout, time::Duration};
+use std::{collections::VecDeque, io::Stdout};
 
 use crossterm::{
-    event::{EventStream, KeyCode, KeyEvent},
+    event::{KeyCode, KeyEvent},
     terminal,
 };
-use futures::{future::Fuse, stream::Next, FutureExt, StreamExt};
 use indexmap::IndexMap;
 use ratatui::{
     backend::CrosstermBackend,
@@ -14,13 +13,13 @@ use ratatui::{
     widgets::{Block, Borders, List, ListDirection},
     Frame, Terminal,
 };
-use tokio::{
-    select,
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-};
+use tokio::{select, sync::mpsc};
 use tui_textarea::TextArea;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    event::{Event, EventHandler, Message},
+};
 
 pub struct Chat<'a> {
     lines: VecDeque<Line<'a>>,
@@ -62,7 +61,6 @@ impl<'a> Chat<'a> {
         }
     }
 
-    //TODO: remove clones
     pub fn list(&self, title: String) -> List<'a> {
         List::new(self.lines.clone())
             .direction(ListDirection::BottomToTop)
@@ -111,41 +109,55 @@ impl Tui<'_> {
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_handler_tx, handler_rx) = mpsc::unbounded_channel();
-        let mut handler =
-            EventHandler::new(cfg.clone(), event_tx, handler_rx, Duration::from_millis(60));
+        let mut handler = EventHandler::new(cfg.clone(), event_tx, handler_rx);
 
         tokio::spawn(async move {
             handler.run().await.unwrap();
         });
 
         let mention_finder = memchr::memmem::Finder::new(cfg.username.as_ref());
+
+        let mut redraw = false;
         loop {
-            let Some(e) = event_rx.recv().await else {
-                continue;
-            };
-            match e {
-                Event::Key(k) => match k {
-                    KeyEvent {
-                        code: KeyCode::Char('q'),
-                        ..
-                    } => {
-                        break;
+            select! {
+                Some(e) = event_rx.recv() => {
+                    match e {
+                        Event::Key(k) => {
+                            match k {
+                                KeyEvent {
+                                    code: KeyCode::Char('q'),
+                                    ..
+                                } => {
+                                    break;
+                                }
+                                _ => {
+                                    // WeirdChamp forced to use crossterm keyevent
+                                    self.textarea.input(k);
+                                }
+                            };
+
+                            redraw = true;
+                        }
+                        Event::Message(message) => {
+                            if let Some(c) = self.tabs.get_mut(&message.channel) {
+                                if self.active_tab
+                                    .as_ref()
+                                    .is_some_and(|tab| tab == &message.channel) {
+                                    redraw = true;
+                                }
+                                c.push_message(&mention_finder, message);
+                            }
+                        }
+                        Event::Redraw => redraw = true,
+
                     }
-                    _ => {
-                        // WeirdChamp forced to use crossterm keyevent
-                        self.textarea.input(k);
-                    }
-                },
-                Event::Draw => {
-                    term.draw(|frame| {
-                        self.render(frame);
-                    })?;
                 }
-                Event::Message(message) => {
-                    if let Some(c) = self.tabs.get_mut(&message.channel) {
-                        c.push_message(&mention_finder, message);
-                    }
-                }
+            }
+
+            if redraw {
+                term.draw(|frame| {
+                    self.render(frame);
+                })?;
             }
         }
 
@@ -189,120 +201,5 @@ impl Tui<'_> {
         } else {
             frame.render_widget(tabs, chunks[0]);
         }
-    }
-}
-
-#[derive(PartialEq, PartialOrd)]
-pub enum Event {
-    Draw,
-    Key(crossterm::event::KeyEvent),
-    Message(Message),
-}
-
-#[derive(PartialEq, PartialOrd)]
-pub enum HandlerEvent {}
-
-#[derive(Clone, PartialEq, PartialOrd)]
-pub struct Message {
-    channel: String,
-    username: String,
-    msg: String,
-}
-
-pub struct EventHandler {
-    handler_rx: UnboundedReceiver<HandlerEvent>,
-    event_tx: UnboundedSender<Event>,
-    frame_duration: Duration,
-    cfg: Config,
-}
-
-impl EventHandler {
-    pub fn new(
-        cfg: Config,
-        event_tx: UnboundedSender<Event>,
-        handler_rx: UnboundedReceiver<HandlerEvent>,
-        frame_duration: Duration,
-    ) -> Self {
-        Self {
-            event_tx,
-            handler_rx,
-            frame_duration,
-            cfg,
-        }
-    }
-
-    pub async fn run(&mut self) -> eyre::Result<()> {
-        let mut draw_interval = tokio::time::interval(self.frame_duration);
-        let mut reader = crossterm::event::EventStream::new();
-        let mut client = tmi::Client::builder()
-            .credentials(tmi::Credentials {
-                login: self.cfg.username.to_string(),
-                token: Some(self.cfg.token.to_string()),
-            })
-            .connect()
-            .await?;
-
-        client.join_all(&self.cfg.channels).await?;
-
-        let mut tmi_event_tx = self.event_tx.clone();
-        loop {
-            let term_event = reader.next().fuse();
-            let draw_delay = draw_interval.tick();
-
-            select! {
-                e = self.handler_rx.recv() => {
-                    if let Some(_e) = e {
-                        // Placeholder
-                    }
-                }
-                _ = draw_delay => {
-                    self.event_tx.send(Event::Draw)?;
-                }
-                _ = Self::crossterm_event(term_event, &mut self.event_tx) => {}
-                _ = Self::tmi_event(&self.cfg, &mut client, &mut tmi_event_tx) => {}
-            }
-        }
-    }
-
-    async fn crossterm_event(
-        term_event: Fuse<Next<'_, EventStream>>,
-        event_tx: &mut UnboundedSender<Event>,
-    ) -> eyre::Result<()> {
-        #[allow(clippy::collapsible_match, clippy::single_match)]
-        if let Some(Ok(e)) = term_event.await {
-            match e {
-                crossterm::event::Event::Key(k) => {
-                    event_tx.send(Event::Key(k))?;
-                }
-                _ => (),
-            }
-        }
-        Ok(())
-    }
-
-    async fn tmi_event<'a>(
-        cfg: &Config,
-        client: &mut tmi::Client,
-        event_tx: &mut UnboundedSender<Event>,
-    ) -> eyre::Result<()> {
-        let msg = client.recv().await?;
-        match msg.as_typed()? {
-            tmi::Message::Privmsg(msg) => {
-                event_tx.send(Event::Message(Message {
-                    channel: msg.channel().into(),
-                    username: msg.sender().name().into(),
-                    msg: msg.text().into(),
-                }))?;
-            }
-            tmi::Message::Reconnect => {
-                client.reconnect().await?;
-                client.join_all(&cfg.channels).await?;
-            }
-            tmi::Message::Ping(ping) => {
-                client.pong(&ping).await?;
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
