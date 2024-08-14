@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use color_eyre::eyre;
 use eyre::OptionExt;
 use serde::Deserialize;
 use triomphe::Arc;
@@ -7,6 +8,7 @@ use triomphe::Arc;
 #[derive(Deserialize)]
 pub struct ConfigData<'a> {
     pub username: Cow<'a, str>,
+    // TODO: store token in keyring instead of config
     pub token: Cow<'a, str>,
     pub channels: Vec<Cow<'a, str>>,
 }

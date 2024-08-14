@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 dirs = "5.0.1"
-eyre = "0.6.12"
 crossterm = { version = "0.28.0", features = ["event-stream"] }
 ratatui = "0.28.0"
 ratatui-image = "1.0.5"
@@ -18,3 +17,13 @@ indexmap = "2.3.0"
 tui-textarea = "0.6.1"
 memchr = "2.7.4"
 triomphe = "0.1.13"
+cacache = { version = "13.0.0", default-features = false, features = [
+  "mmap",
+  "tokio-runtime",
+] }
+reqwest = { version = "0.12.5", features = ["json"] }
+rkyv = { version = "0.7.44", features = ["validation"] }
+bytecheck = "0.6.9"
+color-eyre = "0.6.3"
+blake3 = "1.5.3"
+image = "0.25.2"

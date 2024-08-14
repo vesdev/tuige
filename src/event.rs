@@ -1,3 +1,6 @@
+use core::panic;
+
+use color_eyre::eyre;
 use crossterm::event::EventStream;
 use futures::{future::Fuse, stream::Next, FutureExt, StreamExt};
 use tokio::{
@@ -5,7 +8,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
-use crate::config::Config;
+use crate::{config::Config, request::ReqCache};
 
 #[derive(PartialEq, PartialOrd)]
 pub enum Event {
@@ -28,11 +31,13 @@ pub struct EventHandler {
     handler_rx: UnboundedReceiver<HandlerEvent>,
     event_tx: UnboundedSender<Event>,
     cfg: Config,
+    req: ReqCache,
 }
 
 impl EventHandler {
     pub fn new(
         cfg: Config,
+        disk_cache_dir: String,
         event_tx: UnboundedSender<Event>,
         handler_rx: UnboundedReceiver<HandlerEvent>,
     ) -> Self {
@@ -40,11 +45,16 @@ impl EventHandler {
             event_tx,
             handler_rx,
             cfg,
+            req: ReqCache::new(disk_cache_dir),
         }
     }
 
     pub async fn run(&mut self) -> eyre::Result<()> {
         let mut reader = crossterm::event::EventStream::new();
+
+        let mut tmi_event_tx = self.event_tx.clone();
+        let cfg = self.cfg.clone();
+
         let mut client = tmi::Client::builder()
             .credentials(tmi::Credentials {
                 login: self.cfg.username.to_string(),
@@ -52,9 +62,6 @@ impl EventHandler {
             })
             .connect()
             .await?;
-
-        let mut tmi_event_tx = self.event_tx.clone();
-        let cfg = self.cfg.clone();
 
         tokio::spawn(async move {
             client.join_all(&cfg.channels).await.unwrap();
@@ -75,7 +82,6 @@ impl EventHandler {
                     }
                 }
                 _ = Self::crossterm_event(term_event, &mut self.event_tx) => {}
-                // _ = Self::tmi_event(&self.cfg, &mut client, &mut tmi_event_tx) => {}
             }
         }
     }
@@ -99,7 +105,7 @@ impl EventHandler {
         Ok(())
     }
 
-    async fn tmi_event<'a>(
+    async fn tmi_event(
         cfg: &Config,
         client: &mut tmi::Client,
         event_tx: &mut UnboundedSender<Event>,

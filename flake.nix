@@ -31,7 +31,7 @@
             openssl
           ];
 
-          buildInputs = with pkgs; [ ];
+          buildInputs = with pkgs; [ openssl ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
 

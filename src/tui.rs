@@ -1,5 +1,7 @@
 use std::{collections::VecDeque, io::Stdout};
 
+use color_eyre::config::HookBuilder;
+use color_eyre::eyre;
 use crossterm::{
     event::{KeyCode, KeyEvent},
     terminal,
@@ -93,7 +95,8 @@ impl Default for Tui<'_> {
 }
 
 impl Tui<'_> {
-    pub async fn run(&mut self, cfg: Config) -> eyre::Result<()> {
+    pub async fn run(&mut self, cfg: Config, cache_dir: String) -> eyre::Result<()> {
+        Self::init_error_hooks()?;
         let mut term = self.enter()?;
         self.active_tab = Some(cfg.channels.first().map_or("".into(), |s| s.to_string()));
         self.tabs = IndexMap::from_iter(
@@ -109,11 +112,14 @@ impl Tui<'_> {
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_handler_tx, handler_rx) = mpsc::unbounded_channel();
-        let mut handler = EventHandler::new(cfg.clone(), event_tx, handler_rx);
 
-        tokio::spawn(async move {
-            handler.run().await.unwrap();
-        });
+        {
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                let mut handler = EventHandler::new(cfg, cache_dir, event_tx, handler_rx);
+                handler.run().await.unwrap();
+            })
+        };
 
         let mention_finder = memchr::memmem::Finder::new(cfg.username.as_ref());
 
@@ -161,7 +167,22 @@ impl Tui<'_> {
             }
         }
 
-        self.leave(term)
+        Self::leave()
+    }
+
+    fn init_error_hooks() -> eyre::Result<()> {
+        let (panic, error) = HookBuilder::default().into_hooks();
+        let panic = panic.into_panic_hook();
+        let error = error.into_eyre_hook();
+        eyre::set_hook(Box::new(move |e| {
+            let _ = Self::leave();
+            error(e)
+        }))?;
+        std::panic::set_hook(Box::new(move |e| {
+            let _ = Self::leave();
+            panic(e)
+        }));
+        Ok(())
     }
 
     fn enter(&self) -> eyre::Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -172,7 +193,7 @@ impl Tui<'_> {
         Ok(term)
     }
 
-    fn leave(&self, _term: Terminal<CrosstermBackend<Stdout>>) -> eyre::Result<()> {
+    fn leave() -> eyre::Result<()> {
         crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
         Ok(())
