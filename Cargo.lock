@@ -2476,9 +2476,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tmi"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c046cc07e5db510c74be3331144153aaa5a435ffe013b589601a7500e85e5bd"
+checksum = "06d47173dedea650c10fadfdc0f6994be0f7e288dd3100e3a4a170f1d93eb55f"
 dependencies = [
  "cfg-if",
  "chrono",
