@@ -1,55 +1,23 @@
-use std::{collections::HashMap, io::Cursor};
-
-use color_eyre::eyre;
+use color_eyre::eyre::{self};
 use futures::StreamExt;
 use image::DynamicImage;
+use lru::LruCache;
 use rkyv::{with::CopyOptimize, Archive, Deserialize, Serialize};
+use std::{io::Cursor, num::NonZero};
 use triomphe::Arc;
 
-// SAFETY:
-// pointer gets immediately dropped
-// used to get around borrow checker limitation
-// do not use with a shared reference cache
-macro_rules! check_cache {
-    ($cache:expr, $use_disk_cache:expr, $key:expr) => {
-        unsafe {
-            if let Ok(Some(v)) = (*($cache as *mut Self))
-                .read_cache($use_disk_cache, $key)
-                .await
-            {
-                return Ok(v);
-            }
-        }
-    };
-}
-
-macro_rules! write_cache {
-    ($cache:expr, $use_disk_cache:expr, $key:expr, $val:expr) => {
-        unsafe {
-            if let Ok(v) = (*($cache as *mut Self))
-                .write_cache($use_disk_cache, $key, $val)
-                .await
-            {
-                Ok(v)
-            } else {
-                Err(eyre::eyre!("failed writing to cache"))
-            }
-        }
-    };
-}
-
-pub struct ReqCache {
+pub struct Cache {
     http: reqwest::Client,
     disk_cache_dir: String,
-    local_cache: HashMap<String, Value>,
+    lru: lru::LruCache<String, Value>,
 }
 
-impl ReqCache {
+impl Cache {
     pub fn new(disk_cache_dir: String) -> Self {
         Self {
             http: reqwest::Client::new(),
             disk_cache_dir,
-            local_cache: HashMap::new(),
+            lru: LruCache::new(NonZero::new(100).unwrap()),
         }
     }
 
@@ -58,18 +26,16 @@ impl ReqCache {
         use_disk_cache: bool,
         key: &str,
     ) -> eyre::Result<Option<&Value>> {
-        // Check memory cache
-        if self.local_cache.contains_key(key) {
-            return Ok(Some(self.local_cache.get(key).unwrap()));
+        if self.lru.contains(key) {
+            return Ok(Some(self.lru.get(key).unwrap()));
         }
 
-        // Check disk cache
         if use_disk_cache {
             if let Ok(val) = Self::read_disk_cache_bytes::<Vec<u8>>(&self.disk_cache_dir, key).await
             {
                 if let Ok(val) = rkyv::from_bytes::<RawCacheValue>(&val[..]) {
-                    self.local_cache.insert(key.into(), val.into());
-                    return Ok(Some(self.local_cache.get(key).unwrap()));
+                    self.lru.put(key.into(), val.into());
+                    return Ok(Some(self.lru.get(key).unwrap()));
                 }
             }
         }
@@ -87,8 +53,8 @@ impl ReqCache {
             self.write_disk_cache(key, &val).await?;
         }
 
-        self.local_cache.insert(key.into(), val.into());
-        Ok(self.local_cache.get(key).unwrap())
+        self.lru.put(key.into(), val.into());
+        Ok(self.lru.get(key).unwrap())
     }
 
     async fn write_disk_cache(&mut self, key: &str, val: &RawCacheValue) -> eyre::Result<()> {
@@ -111,132 +77,172 @@ impl ReqCache {
         Ok(())
     }
 
-    pub async fn get_client_id<'a>(&'a mut self, token: &str) -> eyre::Result<&'a Value> {
+    async fn cache<
+        'a,
+        'b,
+        Fut: futures::Future<Output = eyre::Result<RawCacheValue>>,
+        F: FnOnce(&'a mut Cache) -> Fut,
+    >(
+        &'a mut self,
+        descriptor: CacheValueDescriptor<'b>,
+        callback: F,
+    ) -> eyre::Result<&'a Value> {
+        unsafe {
+            if let Ok(Some(v)) = {
+                let ptr = self as *mut Self;
+                (*ptr)
+                    .read_cache(descriptor.use_disk_cache, descriptor.key)
+                    .await
+            } {
+                return Ok(v);
+            }
+
+            let ptr = self as *mut Self;
+            let value = callback(self);
+
+            (*ptr)
+                .write_cache(descriptor.use_disk_cache, descriptor.key, value.await?)
+                .await
+        }
+    }
+
+    pub async fn get_client_id(&mut self, token: &str) -> eyre::Result<&Value> {
         let url = "https://id.twitch.tv/oauth2/validate";
 
         // Don't store plaintext token in cache
         let hashed_token = blake3::hash(token.as_bytes());
-        let cache_location = format!("{url}/{hashed_token}");
 
-        check_cache!(self, true, &cache_location);
+        self.cache(
+            CacheValueDescriptor {
+                use_disk_cache: true,
+                key: &format!("{url}/{hashed_token}"),
+            },
+            |cache| async move {
+                let req = cache.http.get(url).bearer_auth(token).build()?;
 
-        let req = self.http.get(url).bearer_auth(token).build()?;
+                let resp = cache
+                    .http
+                    .execute(req)
+                    .await?
+                    .json::<response::twitch::Validate>()
+                    .await?;
 
-        let resp = self
-            .http
-            .execute(req)
-            .await?
-            .json::<response::twitch::Validate>()
-            .await?;
-
-        write_cache!(
-            self,
-            true,
-            &cache_location,
-            RawCacheValue::ClientId(resp.client_id)
+                Ok(RawCacheValue::ClientId(resp.client_id))
+            },
         )
+        .await
     }
 
-    pub async fn get_user_id<'a>(
-        &'a mut self,
+    pub async fn get_user_id(
+        &mut self,
         client_id: &str,
         username: &str,
         token: &str,
-    ) -> eyre::Result<&'a Value> {
-        let url = format!("https://api.twitch.tv/helix/users?login={username}");
-        check_cache!(self, true, &url);
+    ) -> eyre::Result<&Value> {
+        let url = &format!("https://api.twitch.tv/helix/users?login={username}");
 
-        let req = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .header("Client-Id", client_id)
-            .build()?;
+        self.cache(
+            CacheValueDescriptor {
+                use_disk_cache: true,
+                key: url,
+            },
+            |cache| async move {
+                let req = cache
+                    .http
+                    .get(url)
+                    .bearer_auth(token)
+                    .header("Client-Id", client_id)
+                    .build()?;
 
-        let resp = self
-            .http
-            .execute(req)
-            .await?
-            .json::<response::twitch::User>()
-            .await?;
+                let resp = cache
+                    .http
+                    .execute(req)
+                    .await?
+                    .json::<response::twitch::User>()
+                    .await?;
 
-        write_cache!(
-            self,
-            true,
-            &url,
-            RawCacheValue::UserId(resp.data.first().unwrap().id.clone())
+                Ok(RawCacheValue::UserId(resp.data.first().unwrap().id.clone()))
+            },
         )
+        .await
     }
 
-    #[allow(clippy::needless_lifetimes)]
-    pub async fn get_global_emotes<'a>(
-        &'a mut self,
+    pub async fn get_global_emotes(
+        &mut self,
         client_id: String,
         token: String,
-    ) -> eyre::Result<&'a Value> {
+    ) -> eyre::Result<&Value> {
         let client_id = Arc::new(client_id);
         let token = Arc::new(token);
         let url = "https://api.twitch.tv/helix/chat/emotes/global";
-        check_cache!(self, true, url);
+        self.cache(
+            CacheValueDescriptor {
+                use_disk_cache: true,
+                key: url,
+            },
+            |cache| async move {
+                let req = cache
+                    .http
+                    .get(url)
+                    .bearer_auth(token.as_ref())
+                    .header("Client-Id", client_id.as_ref())
+                    .build()?;
 
-        // get emotes
-        let req = self
-            .http
-            .get(url)
-            .bearer_auth(token.as_ref())
-            .header("Client-Id", client_id.as_ref())
-            .build()?;
+                let resp = cache
+                    .http
+                    .execute(req)
+                    .await?
+                    .json::<response::twitch::GlobalEmotes>()
+                    .await?;
 
-        let resp = self
-            .http
-            .execute(req)
-            .await?
-            .json::<response::twitch::GlobalEmotes>()
-            .await?;
+                let emote_count = resp.data.len();
+                let http = cache.http.clone();
+                let set = futures::stream::iter(resp.data)
+                    .map(|emote| {
+                        let http = http.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move {
+                            let image_1x = emote.images.get("url_1x").unwrap();
 
-        let emote_count = resp.data.len();
-        let http = self.http.clone();
-        let set = futures::stream::iter(resp.data)
-            .map(|emote| {
-                let http = http.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    let image_1x = emote.images.get("url_1x").unwrap();
+                            // download emote
+                            let req = http.get(image_1x).bearer_auth(token).build().unwrap();
 
-                    // download emote
-                    let req = http.get(image_1x).bearer_auth(token).build().unwrap();
+                            let resp = http.execute(req).await.unwrap().bytes().await.unwrap();
 
-                    let resp = http.execute(req).await.unwrap().bytes().await.unwrap();
+                            Emote::transcode_from_bytes(emote.name, &resp)
+                        })
+                    })
+                    .buffer_unordered(5);
 
-                    Emote::transcode_from_bytes(emote.name, &resp)
-                })
-            })
-            .buffer_unordered(5);
+                let set = set
+                    .fold(
+                        (
+                            Vec::<Emote>::with_capacity(emote_count),
+                            Vec::<RawEmote>::with_capacity(emote_count),
+                        ),
+                        |mut s, emote_resp| async move {
+                            if let Ok(Ok((emote, image))) = emote_resp {
+                                s.1.push(emote);
+                                s.0.push(image);
+                            }
+                            s
+                        },
+                    )
+                    .await;
 
-        let set = set
-            .fold(
-                (
-                    Vec::<Emote>::with_capacity(emote_count),
-                    Vec::<RawEmote>::with_capacity(emote_count),
-                ),
-                |mut s, emote_resp| async move {
-                    if let Ok(Ok((emote, image))) = emote_resp {
-                        s.1.push(emote);
-                        s.0.push(image);
-                    }
-                    s
-                },
-            )
-            .await;
-
-        // Skip with RawEmote -> Emote conversion
-        self.write_disk_cache(url, &RawCacheValue::EmoteSet(set.1))
-            .await?;
-        self.local_cache.insert(url.into(), Value::EmoteSet(set.0));
-        Ok(self.local_cache.get(url).unwrap())
+                Ok(RawCacheValue::EmoteSet(set.1))
+            },
+        )
+        .await
     }
 }
 
+struct CacheValueDescriptor<'a> {
+    use_disk_cache: bool,
+    key: &'a str,
+}
+
+#[derive(Debug)]
 pub enum Value {
     ClientId(String),
     UserId(String),
@@ -255,6 +261,7 @@ impl From<RawCacheValue> for Value {
     }
 }
 
+#[derive(Debug)]
 pub struct Emote {
     name: String,
     image: DynamicImage,

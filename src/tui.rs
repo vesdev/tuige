@@ -184,7 +184,6 @@ impl<'a> State<'a> {
     }
 }
 
-#[derive(Default)]
 pub struct Tui;
 
 impl Tui {

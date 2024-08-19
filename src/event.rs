@@ -8,7 +8,10 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
-use crate::{config::Config, request::ReqCache};
+use crate::{
+    config::Config,
+    request::{Cache, Value},
+};
 
 #[derive(Clone, PartialEq, PartialOrd)]
 pub struct Message {
@@ -40,7 +43,7 @@ pub struct EventHandler {
     handler_rx: UnboundedReceiver<ev::Send>,
     event_tx: UnboundedSender<ev::In>,
     cfg: Config,
-    req: ReqCache,
+    cache: Cache,
 }
 
 impl EventHandler {
@@ -54,7 +57,7 @@ impl EventHandler {
             event_tx,
             handler_rx,
             cfg,
-            req: ReqCache::new(disk_cache_dir),
+            cache: Cache::new(disk_cache_dir),
         }
     }
 
@@ -95,7 +98,6 @@ impl EventHandler {
                                 let _ = message_tx.send(message);
                             }
                         }
-                        // Placeholder
                     }
                 }
                 _ = Self::crossterm_event(term_event, &mut self.event_tx) => {}

@@ -14,7 +14,5 @@ async fn main() -> eyre::Result<()> {
         .ok_or_eyre("unable to find cache directory")?
         .join("tuige");
 
-    Tui::default()
-        .run(cfg, cache_dir.to_str().unwrap().into())
-        .await
+    Tui.run(cfg, cache_dir.to_str().unwrap().into()).await
 }

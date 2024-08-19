@@ -2730,6 +2730,7 @@ dependencies = [
  "futures",
  "image",
  "indexmap",
+ "lru",
  "memchr",
  "ratatui",
  "ratatui-image",
