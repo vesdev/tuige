@@ -1,5 +1,7 @@
 [package]
 name = "tuige"
+description = "smol twitch chat tui"
+license-file = "LICENSE"
 version = "0.1.0"
 edition = "2021"
 
